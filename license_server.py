@@ -1,4 +1,4 @@
-import os, json, time, tempfile
+import os, json, time, re, tempfile
 from typing import Optional, Dict, Any, List
 
 from fastapi import FastAPI, HTTPException, Header
@@ -7,11 +7,11 @@ import jwt  # PyJWT
 
 app = FastAPI()
 
-# ----- Config -----
+# ===== Config =====
 APP_ID = "ark-watchdog"
 LICENSE_KEYS_FILE = os.environ.get("LICENSE_KEYS_FILE") or os.path.join(os.path.dirname(__file__), "valid_keys.json")
 TOKEN_TTL = int(os.environ.get("TOKEN_TTL_SECONDS", "86400"))
-ADMIN_TOKEN = os.environ.get("ADMIN_TOKEN")
+ADMIN_TOKEN = os.environ.get("ADMIN_TOKEN")  # set this in Render → Environment
 
 def _load_private_key() -> str:
     pem = os.environ.get("LW_PRIVATE_KEY_PEM")
@@ -29,7 +29,7 @@ def _load_private_key() -> str:
 
 PRIVATE_KEY_PEM = _load_private_key()
 
-# ----- Store helpers (always read from disk) -----
+# ===== Helpers =====
 def read_store() -> Dict[str, Any]:
     try:
         with open(LICENSE_KEYS_FILE, "r", encoding="utf-8") as f:
@@ -37,7 +37,6 @@ def read_store() -> Dict[str, Any]:
     except FileNotFoundError:
         return {}
     except json.JSONDecodeError:
-        # keep service alive even if file is corrupted
         return {}
 
 def write_store(data: Dict[str, Any]) -> None:
@@ -47,7 +46,17 @@ def write_store(data: Dict[str, Any]) -> None:
         json.dump(data, f, indent=2)
     os.replace(tmp, LICENSE_KEYS_FILE)
 
-# ----- Models -----
+def _norm_machine(m: str) -> str:
+    """Canonicalize any incoming machine string to 16-char lowercase hex."""
+    m = (m or "").strip().lower()
+    if re.fullmatch(r"[0-9a-f]{32,}", m):
+        return m[:16]
+    only_hex = "".join(ch for ch in m if ch in "0123456789abcdef")
+    if len(only_hex) >= 16:
+        return only_hex[:16]
+    return m[:16]
+
+# ===== Models =====
 class ActivatePayload(BaseModel):
     key: str
     machine: str
@@ -64,17 +73,16 @@ class RemoveMachinePayload(BaseModel):
     key: str
     machine: str
 
-# ----- Admin guard -----
 def require_admin(token: Optional[str]):
     if not ADMIN_TOKEN:
         raise HTTPException(status_code=403, detail="admin token not configured")
     if token != ADMIN_TOKEN:
         raise HTTPException(status_code=403, detail="forbidden")
 
-# ----- API -----
+# ===== API =====
 @app.get("/health")
 def health():
-    store = read_store()  # fresh read every call
+    store = read_store()
     return {"ok": True, "app": APP_ID, "keys": len(store), "store": LICENSE_KEYS_FILE}
 
 @app.post("/api/activate")
@@ -95,22 +103,34 @@ def activate(p: ActivatePayload):
         raise HTTPException(status_code=402, detail="expired")
 
     seats = int(lic.get("seats", 1))
-    machines: List[str] = list(lic.get("machines", []))
 
-    if p.machine not in machines:
+    # Normalize existing stored machines and incoming machine
+    machines: List[str] = [_norm_machine(x) for x in lic.get("machines", [])]
+    nmach = _norm_machine(p.machine)
+    if not nmach:
+        raise HTTPException(status_code=400, detail="bad machine")
+
+    # De-dup and persist normalization if it changed anything
+    normalized_changed = (machines != lic.get("machines", []))
+    machines = list(dict.fromkeys(machines))  # de-dup preserving order
+
+    if nmach not in machines:
         if len(machines) >= seats:
             raise HTTPException(status_code=409, detail="seat limit reached")
-        machines.append(p.machine)
+        machines.append(nmach)
+        normalized_changed = True
+
+    if normalized_changed:
         lic["machines"] = machines
         store[p.key] = lic
-        write_store(store)  # persist binding
+        write_store(store)
 
-    # mint token
+    # Mint token with canonical machine id
     exp = min(now + TOKEN_TTL, exp_unix)
     payload = {
         "sub": p.key,
         "aud": APP_ID,
-        "machine": p.machine,
+        "machine": nmach,  # canonical 16-char lowercase hex
         "plan": lic.get("plan", "unknown"),
         "iat": now,
         "nbf": now,
@@ -130,7 +150,7 @@ def admin_upsert(payload: UpsertPayload, x_admin_token: str = Header(default="")
         "plan": payload.plan,
         "expires_unix": int(payload.expires_unix),
         "seats": int(payload.seats),
-        "machines": lic.get("machines", []),
+        "machines": [_norm_machine(m) for m in lic.get("machines", [])],
     })
     store[payload.key] = lic
     write_store(store)
@@ -143,7 +163,8 @@ def admin_remove_machine(payload: RemoveMachinePayload, x_admin_token: str = Hea
     lic = store.get(payload.key)
     if not lic:
         raise HTTPException(status_code=404, detail="not found")
-    lic["machines"] = [m for m in lic.get("machines", []) if m != payload.machine]
+    tgt = _norm_machine(payload.machine)
+    lic["machines"] = [m for m in [_norm_machine(x) for x in lic.get("machines", [])] if m != tgt]
     store[payload.key] = lic
     write_store(store)
     return {"ok": True, "machines": lic["machines"]}
