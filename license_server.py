@@ -1,9 +1,11 @@
 # license_server.py
 import os, json, time, re
 from typing import Optional, Dict, Any, List
+from datetime import datetime, timezone
 
 from fastapi import FastAPI, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 import jwt  # PyJWT
 
@@ -19,6 +21,7 @@ LICENSE_KEYS_FILE = os.environ.get("LICENSE_KEYS_FILE") or os.path.join(
 )
 TOKEN_TTL = int(os.environ.get("TOKEN_TTL_SECONDS", "86400"))  # 1 day default
 ADMIN_TOKEN = os.environ.get("ADMIN_TOKEN")  # set in Render → Environment
+CLOCK_SKEW_SECONDS = int(os.environ.get("TOKEN_CLOCK_SKEW_SECONDS", "120"))
 
 # ────────────────────────────────────────────────────────────────────────────────
 # Private key loader (supports PEM in env with \n)
@@ -45,6 +48,7 @@ def _load_private_key() -> str:
     )
 
 PRIVATE_KEY_PEM = _load_private_key()
+BASE_DIR = os.path.dirname(__file__)
 
 # ────────────────────────────────────────────────────────────────────────────────
 # Store helpers
@@ -99,6 +103,9 @@ class UpsertPayload(BaseModel):
     plan: str = "monthly"
     expires_unix: int
     seats: int = 1
+    user_id: Optional[str] = None
+    user_name: Optional[str] = None
+    user_email: Optional[str] = None
 
 class RemoveMachinePayload(BaseModel):
     key: str
@@ -121,6 +128,14 @@ app.add_middleware(
 def health():
     store = read_store()
     return {"ok": True, "app": APP_ID, "keys": len(store), "store": LICENSE_KEYS_FILE}
+
+
+@app.get("/admin/dashboard")
+def admin_dashboard():
+    dashboard_path = os.path.join(BASE_DIR, "dashboard.html")
+    if not os.path.exists(dashboard_path):
+        raise HTTPException(status_code=404, detail="dashboard not found")
+    return FileResponse(dashboard_path)
 
 @app.post("/api/activate")
 def activate(p: ActivatePayload):
@@ -159,6 +174,7 @@ def activate(p: ActivatePayload):
         write_store(store)
 
     # Mint token (include both 'aud' and 'app' for client compatibility)
+    issued_at = max(now - max(CLOCK_SKEW_SECONDS, 0), 0)
     exp = min(now + TOKEN_TTL, exp_unix)
     payload = {
         "sub": p.key,
@@ -166,8 +182,8 @@ def activate(p: ActivatePayload):
         "app": APP_ID,
         "machine": nmach,
         "plan": lic.get("plan", "unknown"),
-        "iat": now,
-        "nbf": now,
+        "iat": issued_at,
+        "nbf": issued_at,
         "exp": exp,
     }
     token = jwt.encode(payload, PRIVATE_KEY_PEM, algorithm="RS256")
@@ -186,6 +202,12 @@ def admin_upsert(payload: UpsertPayload, x_admin_token: str = Header(default="")
         "seats": int(payload.seats),
         "machines": [_norm_machine(m) for m in lic.get("machines", [])],
     })
+    if payload.user_id is not None:
+        lic["user_id"] = payload.user_id
+    if payload.user_name is not None:
+        lic["user_name"] = payload.user_name
+    if payload.user_email is not None:
+        lic["user_email"] = payload.user_email
     store[payload.key] = lic
     write_store(store)
     return {"ok": True, "key": payload.key, "machines": lic["machines"]}
@@ -217,3 +239,51 @@ def admin_list(x_admin_token: str = Header(default="")):
     _require_admin(x_admin_token)
     store = read_store()
     return {"count": len(store), "keys": list(store.keys())}
+
+
+@app.get("/admin/dashboard_data")
+def admin_dashboard_data(x_admin_token: str = Header(default="")):
+    _require_admin(x_admin_token)
+    store = read_store()
+    now = int(time.time())
+    rows = []
+
+    for key, lic in store.items():
+        expires_unix = int(lic.get("expires_unix", 0))
+        is_expired = expires_unix <= now
+        machines = [_norm_machine(x) for x in lic.get("machines", [])]
+        machines = list(dict.fromkeys(machines))
+        seats = int(lic.get("seats", 1))
+        status = "active"
+
+        if not bool(lic.get("active", False)):
+            status = "inactive"
+        elif is_expired:
+            status = "expired"
+        elif len(machines) >= seats:
+            status = "at_capacity"
+
+        rows.append(
+            {
+                "key": key,
+                "status": status,
+                "active": bool(lic.get("active", False)),
+                "plan": lic.get("plan", "unknown"),
+                "expires_unix": expires_unix,
+                "expires_iso": datetime.fromtimestamp(
+                    expires_unix, tz=timezone.utc
+                ).isoformat()
+                if expires_unix > 0
+                else None,
+                "seats": seats,
+                "seats_used": len(machines),
+                "seats_remaining": max(seats - len(machines), 0),
+                "machines": machines,
+                "user_id": lic.get("user_id"),
+                "user_name": lic.get("user_name"),
+                "user_email": lic.get("user_email"),
+            }
+        )
+
+    rows.sort(key=lambda x: x["key"])
+    return {"count": len(rows), "now_unix": now, "keys": rows}

@@ -19,3 +19,4 @@ valid_keys.json
 # Editors
 .vscode/
 .idea/
+.env

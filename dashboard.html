@@ -1,0 +1,247 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>ARK License Dashboard</title>
+  <style>
+    body { font-family: Arial, sans-serif; margin: 20px; color: #1a1a1a; }
+    h1 { margin-bottom: 8px; }
+    .muted { color: #666; margin-bottom: 16px; }
+    .row { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 12px; }
+    input, select, button { padding: 8px; font-size: 14px; }
+    input { min-width: 180px; }
+    button { cursor: pointer; }
+    .card { border: 1px solid #ddd; border-radius: 8px; padding: 12px; margin-bottom: 16px; }
+    .stats { display: flex; gap: 12px; flex-wrap: wrap; margin-bottom: 12px; }
+    .stat { border: 1px solid #ddd; border-radius: 8px; padding: 10px 12px; min-width: 150px; }
+    table { border-collapse: collapse; width: 100%; }
+    th, td { border: 1px solid #ddd; padding: 8px; text-align: left; font-size: 13px; }
+    th { background: #f5f5f5; }
+    .status-active { color: #137333; font-weight: bold; }
+    .status-inactive { color: #8a1c1c; font-weight: bold; }
+    .status-expired { color: #8a1c1c; font-weight: bold; }
+    .status-at_capacity { color: #a15c00; font-weight: bold; }
+    .ok { color: #137333; }
+    .err { color: #8a1c1c; }
+  </style>
+</head>
+<body>
+  <h1>ARK License Dashboard</h1>
+  <div class="muted">Quickly create keys and monitor active/inactive/expired status.</div>
+
+  <div class="card">
+    <div class="row">
+      <input id="adminToken" type="password" placeholder="Admin token" />
+      <button id="loadBtn">Load Dashboard</button>
+      <span id="loadMsg"></span>
+    </div>
+  </div>
+
+  <div class="card">
+    <h3>Create / Update Key</h3>
+    <div class="row">
+      <input id="key" placeholder="Key (optional, auto-generated if empty by script only)" />
+      <input id="userName" placeholder="User name" />
+      <input id="userEmail" placeholder="User email" />
+      <input id="userId" placeholder="User ID (optional)" />
+    </div>
+    <div class="row">
+      <select id="plan">
+        <option value="monthly">monthly</option>
+        <option value="quarterly">quarterly</option>
+        <option value="annual">annual</option>
+        <option value="lifetime">lifetime</option>
+      </select>
+      <input id="seats" type="number" min="1" value="1" placeholder="Seats" />
+      <input id="years" type="number" min="0" value="0" placeholder="Years" />
+      <input id="months" type="number" min="0" value="0" placeholder="Months" />
+      <input id="days" type="number" min="0" value="30" placeholder="Days" />
+      <label><input id="active" type="checkbox" checked /> Active</label>
+      <button id="saveBtn">Save Key</button>
+    </div>
+    <div id="saveMsg"></div>
+  </div>
+
+  <div class="stats" id="stats"></div>
+  <table>
+    <thead>
+      <tr>
+        <th>Key</th>
+        <th>Status</th>
+        <th>Plan</th>
+        <th>User</th>
+        <th>Email</th>
+        <th>Seats</th>
+        <th>Used</th>
+        <th>Remaining</th>
+        <th>Expires (UTC)</th>
+      </tr>
+    </thead>
+    <tbody id="tbody"></tbody>
+  </table>
+
+  <script>
+    const apiBase = window.location.origin;
+
+    function unixFromDuration(days, months, years) {
+      const totalDays = Number(days || 0) + (Number(months || 0) * 30) + (Number(years || 0) * 365);
+      if (totalDays <= 0) return 0;
+      return Math.floor(Date.now() / 1000) + (totalDays * 86400);
+    }
+
+    function statusClass(status) {
+      return `status-${status}`;
+    }
+
+    function getToken() {
+      return document.getElementById('adminToken').value.trim();
+    }
+
+    async function loadDashboard() {
+      const token = getToken();
+      const loadMsg = document.getElementById('loadMsg');
+      if (!token) {
+        loadMsg.textContent = 'Enter admin token first.';
+        loadMsg.className = 'err';
+        return;
+      }
+
+      loadMsg.textContent = 'Loading...';
+      loadMsg.className = '';
+
+      const resp = await fetch(`${apiBase}/admin/dashboard_data`, {
+        headers: { 'X-Admin-Token': token }
+      });
+
+      if (!resp.ok) {
+        loadMsg.textContent = `Failed (${resp.status})`;
+        loadMsg.className = 'err';
+        return;
+      }
+
+      const data = await resp.json();
+      renderStats(data.keys);
+      renderTable(data.keys);
+      loadMsg.textContent = `Loaded ${data.count} keys`;
+      loadMsg.className = 'ok';
+    }
+
+    function renderStats(keys) {
+      const stats = {
+        total: keys.length,
+        active: keys.filter(k => k.status === 'active').length,
+        at_capacity: keys.filter(k => k.status === 'at_capacity').length,
+        inactive: keys.filter(k => k.status === 'inactive').length,
+        expired: keys.filter(k => k.status === 'expired').length,
+      };
+
+      const container = document.getElementById('stats');
+      container.innerHTML = `
+        <div class="stat"><strong>Total</strong><div>${stats.total}</div></div>
+        <div class="stat"><strong>Active</strong><div>${stats.active}</div></div>
+        <div class="stat"><strong>At Capacity</strong><div>${stats.at_capacity}</div></div>
+        <div class="stat"><strong>Inactive</strong><div>${stats.inactive}</div></div>
+        <div class="stat"><strong>Expired</strong><div>${stats.expired}</div></div>
+      `;
+    }
+
+    function renderTable(keys) {
+      const tbody = document.getElementById('tbody');
+      tbody.innerHTML = '';
+
+      for (const row of keys) {
+        const tr = document.createElement('tr');
+        tr.innerHTML = `
+          <td>${row.key}</td>
+          <td class="${statusClass(row.status)}">${row.status}</td>
+          <td>${row.plan || ''}</td>
+          <td>${row.user_name || ''}</td>
+          <td>${row.user_email || ''}</td>
+          <td>${row.seats}</td>
+          <td>${row.seats_used}</td>
+          <td>${row.seats_remaining}</td>
+          <td>${row.expires_iso || ''}</td>
+        `;
+        tbody.appendChild(tr);
+      }
+    }
+
+    async function saveKey() {
+      const token = getToken();
+      const saveMsg = document.getElementById('saveMsg');
+      if (!token) {
+        saveMsg.textContent = 'Enter admin token first.';
+        saveMsg.className = 'err';
+        return;
+      }
+
+      const key = document.getElementById('key').value.trim();
+      const userName = document.getElementById('userName').value.trim();
+      const userEmail = document.getElementById('userEmail').value.trim();
+      const userId = document.getElementById('userId').value.trim();
+      const plan = document.getElementById('plan').value;
+      const seats = Number(document.getElementById('seats').value || 1);
+      const years = Number(document.getElementById('years').value || 0);
+      const months = Number(document.getElementById('months').value || 0);
+      const days = Number(document.getElementById('days').value || 0);
+      const active = document.getElementById('active').checked;
+
+      if (!key) {
+        saveMsg.textContent = 'Key is required in dashboard mode.';
+        saveMsg.className = 'err';
+        return;
+      }
+      if (seats < 1) {
+        saveMsg.textContent = 'Seats must be at least 1.';
+        saveMsg.className = 'err';
+        return;
+      }
+
+      const expiresUnix = unixFromDuration(days, months, years);
+      if (!expiresUnix) {
+        saveMsg.textContent = 'Set a duration (days/months/years > 0).';
+        saveMsg.className = 'err';
+        return;
+      }
+
+      const payload = {
+        key,
+        active,
+        plan,
+        expires_unix: expiresUnix,
+        seats,
+        user_id: userId || null,
+        user_name: userName || null,
+        user_email: userEmail || null,
+      };
+
+      saveMsg.textContent = 'Saving...';
+      saveMsg.className = '';
+
+      const resp = await fetch(`${apiBase}/admin/upsert`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Admin-Token': token,
+        },
+        body: JSON.stringify(payload),
+      });
+
+      if (!resp.ok) {
+        const text = await resp.text();
+        saveMsg.textContent = `Save failed (${resp.status}): ${text}`;
+        saveMsg.className = 'err';
+        return;
+      }
+
+      saveMsg.textContent = `Saved key ${key}`;
+      saveMsg.className = 'ok';
+      await loadDashboard();
+    }
+
+    document.getElementById('loadBtn').addEventListener('click', loadDashboard);
+    document.getElementById('saveBtn').addEventListener('click', saveKey);
+  </script>
+</body>
+</html>
